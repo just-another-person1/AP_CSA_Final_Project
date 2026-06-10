@@ -1,0 +1,74 @@
+#written in micropython
+import sys #for functions
+import select #see if data is in input buffer
+import time
+from machine import Pin, PWM #for servo-- double check if its diff for high-torque
+
+
+servo = PWM(Pin(15)) #servo is in designated port too 
+servo.freq(50) #standard... 
+
+# Motor 1 Terminals (GP8 and GP9)-- check to make sure it pumps water OUT not suck in lol 
+m1a = Pin(8, Pin.OUT)
+m1b = Pin(9, Pin.OUT)
+
+
+
+def set_angle(angle):
+    angle = max(-90, min(90, angle)) #full range for this motor :( 
+    duty = int(((angle + 90) / 180) * (8192 - 1638) + 1638)
+    servo.duty_u16(duty)
+
+def control_pump(status):
+    if status == 1: #inputs recieved from computer 
+        m1a.value(1) 
+        m1b.value(0)
+    else:
+        m1a.value(0)
+        m1b.value(0)
+
+#initialize!
+set_angle(0)
+control_pump(0)
+
+print("RP2040 BOOTED WITH TIMEOUT SAFETY")
+
+#track the last time i heard from the laptop
+last_heartbeat = time.ticks_ms()
+TIMEOUT_LIMIT_MS = 300  # 0.3 seconds safety window
+
+#main 
+while True:
+    current_time = time.ticks_ms()
+
+    # Check if data is waiting in the serial buffer
+    if select.select([sys.stdin], [], [], 0.001)[0]:
+        raw_line = sys.stdin.readline()
+        raw_line = raw_line.strip()
+
+        if raw_line:
+            try:
+                angle_str, pump_str = raw_line.split(",")
+                angle = int(angle_str) #move to angle given from comp
+                pump = int(pump_str) #on/off based on comp signal 
+
+                # Execute the live data command
+                set_angle(angle)
+                control_pump(pump)
+                
+                #refresh the heartbeat timer since laptop is responding
+                last_heartbeat = current_time
+
+                print(f"--> RP2040 RECEIVED: angle={angle}, pump={pump}")
+
+            except Exception as e:
+                pass
+
+    # If the video stutters and we haven't received data within the timeout limit
+    elif time.ticks_diff(current_time, last_heartbeat) > TIMEOUT_LIMIT_MS:
+        # Force a hard shutdown immediately to prevent flooding
+        control_pump(0)
+        set_angle(0)
+        
+        # Reset the timer so it doesn't print repeatedly while idling
+        last_heartbeat = current_time
