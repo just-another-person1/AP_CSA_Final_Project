@@ -1,0 +1,290 @@
+#maker pi talks to computer through serial # --> com6 port
+#creates messages on discord through webhook
+import cv2 #openCV for camera + image processing 
+import os #envt variables 
+import serial #NEED TO COMMUNICATE W RP2040!!! 
+import time
+from ultralytics import YOLO #you look only once! 
+from flask import Flask, jsonify #web server application; broadcasts pump status to home network
+import threading #runs web server in background 
+import requests   #for discord webhooks 
+import pygame  
+import numpy as np #not really used tbh -- get rid soon (numerical array operations) 
+
+
+system_status = {"jumpscare": 0} #is system in alarm mode?? 
+app = Flask(__name__) #initialize web server app 
+
+@app.route('/status')
+def get_status():
+    return jsonify(system_status)
+
+def run_web_server():
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+web_thread = threading.Thread(target=run_web_server, daemon=True)
+web_thread.start()
+
+#if u have the webhook u can write message without needing to log in; its like a substitute password
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1513278983091912756/azcyxpYcrAqI9ZEnKKYSlNFU2_KGgEgfqzvZ36J3cRWdgte0xva-3Wvxc-diBzkr1vHO"
+last_notification_time = 0
+
+def send_discord_alert():
+    try:
+        requests.post(
+            DISCORD_WEBHOOK, #json lets it send to discord in background; projects on phone (REMEMBER TO TURN OFF SILENT MODE!!)
+            json={"content": "🚨 PUT YOUR PHONE DOWN!!!! GET A J*B 🚨"},
+            timeout=3
+        )
+        print("Discord notification sent.")
+    except Exception as e:
+        print("Discord error:", e)
+
+#my vid/audio
+audio_path = r"C:\Users\anyaa\Downloads\alarm.wav"
+image_path = r"C:\Users\anyaa\Downloads\get_off_phone.png"
+
+warning_image = cv2.imread(image_path)
+
+pygame.mixer.init()
+try:
+    pygame.mixer.music.load(audio_path)
+except Exception as e:
+    print(f"Error loading audio file: {e}")
+
+def play_alarm_audio():
+    try:
+        if not pygame.mixer.music.get_busy(): #doesnt overlap if its alr playing 
+            pygame.mixer.music.play()
+    except Exception as e:
+        print("Audio playback error:", e)
+
+def stop_alarm_audio():
+    try:
+        if pygame.mixer.music.get_busy():
+            pygame.mixer.music.stop()
+    except Exception as e:
+        pass
+
+#This is the serial USB hardware setup!!! --> 
+#115200 baud speed-- i.e. bits per second 
+print("Connecting to serial interface...")
+arduino_serial = serial.Serial(port='COM6', baudrate=115200, timeout=0.01) #HOW MAKER PI 'TALKS' TO COMPUTER!!
+print("Connected to", arduino_serial.port) 
+time.sleep(2)  #let RP2040 connect! otherwise gets overloaded :( 
+
+print("Purging stale serial buffer data...")
+arduino_serial.reset_input_buffer() #delete leftover incoming messages
+arduino_serial.reset_output_buffer() #delete unsent outgoing messages
+
+#set up my ai models now-- BOTH phone + face detection 
+
+#phone detection! 
+#ML CV model-- based on neural network
+os.environ["WANDB_DISABLED"] = "true" #stops weights & biases (allow u to see how accurately/well ur model is performing)
+print("Loading YOLO AI Model weights into memory...")
+phone_model = YOLO(r"C:\Users\anyaa\Downloads\best.pt")
+print("YOLO AI Model Loaded Successfully!")
+
+#open CV face detector :) i got lazy and did not train this myself unfortunately 
+print("Initializing OpenCV Deep Learning Face Detector...")
+#Haar Cascade layout 
+face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
+
+#webcam setup 
+print("Initializing webcam stream...")
+cap = cv2.VideoCapture(0)
+
+if not cap.isOpened():
+    print("Webcam Index 0 busy or missing. Trying fallback Index 1...")
+    cap = cv2.VideoCapture(1)
+
+FRAME_WIDTH = 1280   
+FRAME_HEIGHT = 720  
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+if not cap.isOpened():
+    print("CRITICAL: No active camera streams could be established.")
+else:
+    print("Webcam video connection fully operational!")
+
+#timing/screen tracking for video stream 
+last_notification_time = 0
+fullscreen_active = False  
+
+#state tracking variables
+current_tracked_angle = 0  
+last_known_clean_angle = 0 # Persistent memory core for face angle
+last_phone_seen_time = 0  
+last_face_seen_time = 0    
+last_serial_send_time = 0
+
+#is it firing rn? initialize 
+in_firing_session = False 
+
+# grid boundaries
+LEFT_THIRD_BOUNDARY = FRAME_WIDTH // 3          
+RIGHT_THIRD_BOUNDARY = (FRAME_WIDTH // 3) * 2    
+
+print("\n--- SYSTEM ONLINE ---")
+print("Continuous real-time tracking matrix engaged with 0.8s decay buffer.")
+print("---------------------\n")
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab video frame.") #raw image frame from vid 
+            time.sleep(0.01)
+            continue
+
+        current_time = time.time()  
+
+# draw grid lines-- split by 3rds 
+        cv2.line(frame, (LEFT_THIRD_BOUNDARY, 0), (LEFT_THIRD_BOUNDARY, FRAME_HEIGHT), (255, 255, 255), 1)
+        cv2.line(frame, (RIGHT_THIRD_BOUNDARY, 0), (RIGHT_THIRD_BOUNDARY, FRAME_HEIGHT), (255, 255, 255), 1)
+
+# Look for my phone & draw a bounding box on it
+        yolo_results = phone_model.predict(frame, conf=0.6, max_det=1, verbose=False)
+        phone_in_frame = False
+        
+        for result in yolo_results:
+            if len(result.boxes) > 0:
+                phone_in_frame = True
+                last_phone_seen_time = current_time  #update memory timestamp 
+                for box in result.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0]) #pixel bounds 
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3) #draws red box around phone 
+                    cv2.putText(frame, "PHONE DETECTED", (x1, y1 - 10), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+#track face coordinates + draw bounding box 
+        face_center_x = None
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_detector.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=4, minSize=(60, 60))
+        
+        for (x, y, w, h) in faces:
+            face_center_x = x + (w // 2)
+            face_center_y = y + (h // 2)
+            last_face_seen_time = current_time
+            
+            # Continuously update what zone I amwhen sitting normally
+            if face_center_x < LEFT_THIRD_BOUNDARY:
+                last_known_clean_angle = 45  
+            elif face_center_x > RIGHT_THIRD_BOUNDARY:
+                last_known_clean_angle = -45  
+            else:
+                last_known_clean_angle = 0
+
+  # add rectangle around face, circle in middle (like a target??) 
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.circle(frame, (face_center_x, face_center_y), 6, (0, 0, 255), -1)
+            
+  # Corner markers-- mark where face is 
+            length = int(w * 0.15)
+            cv2.line(frame, (x, y), (x + length, y), (0, 255, 0), 4)
+            cv2.line(frame, (x, y), (x, y + length), (0, 255, 0), 4)
+            cv2.line(frame, (x + w, y), (x + w - length, y), (0, 255, 0), 4)
+            cv2.line(frame, (x + w, y), (x + w, y + length), (0, 255, 0), 4)
+            
+            cv2.putText(frame, f"TARGET LOCK ({last_known_clean_angle} deg)", (x, y - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            break 
+
+#logic loop w 0.8 second delay ************************
+#activate if phone was seen less than 0.8 seconds ago 
+        phone_memory_active = (current_time - last_phone_seen_time) <= 0.8
+
+        if phone_memory_active:
+            # If a session wasn't already active, pull from memory cache
+            if not in_firing_session: #lock onto target position 
+                if face_center_x is not None:
+                    current_tracked_angle = last_known_clean_angle
+                else:
+                    #Use the last known clean tracked position from memory if face is blocked
+                    current_tracked_angle = last_known_clean_angle 
+                
+                in_firing_session = True
+                print(f"NEW SESSION LOCKED: Recalled target position from memory buffer: {current_tracked_angle}°")
+
+#discord notifcations have to be spaced AT LEAST by 30 secs 
+            if current_time - last_notification_time > 30:
+                discord_thread = threading.Thread(target=send_discord_alert, daemon=True)
+                discord_thread.start()
+                last_notification_time = current_time
+
+            system_status["jumpscare"] = 1 #update status 
+            play_alarm_audio()
+            
+            if warning_image is not None and not fullscreen_active:
+                cv2.namedWindow("WARNING_SCREEN", cv2.WND_PROP_FULLSCREEN)
+                cv2.setWindowProperty("WARNING_SCREEN", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                cv2.imshow("WARNING_SCREEN", warning_image)
+                fullscreen_active = True
+
+            pump_state = 1 #water pump in action 
+            
+            if not phone_in_frame:
+                time_left = 0.8 - (current_time - last_phone_seen_time)
+                print(f"PHONE LOST — SUSTAINING BLAST ON BUFFER ({time_left:.1f}s remaining) AT FIXED {current_tracked_angle}°")
+            elif face_center_x is None:
+                print(f"FACE OBSCURED — ENGAGING RECALLED COORD MEMORY AT FIXED {current_tracked_angle}°")
+            else:
+                print(f"BLASTING TARGET AT FIXED {current_tracked_angle}°")
+
+#turn off the pump now + audio :) 
+#note to self-- buy a more absorbant mop 
+        else:
+            in_firing_session = False 
+            pump_state = 0
+            stop_alarm_audio()
+            
+            if fullscreen_active:
+                cv2.destroyWindow("WARNING_SCREEN")
+                fullscreen_active = False
+            system_status["jumpscare"] = 0
+
+        # continuous data stream; still sends messages abt angle + time 
+        if current_time - last_serial_send_time >= 0.05:
+            try:
+                command_packet = f"{current_tracked_angle},{pump_state}\n"
+                arduino_serial.write(command_packet.encode('utf-8'))
+                last_serial_send_time = current_time
+            except Exception:
+                try:
+                    arduino_serial.close()
+                    time.sleep(0.05)
+                    arduino_serial.open()
+                except Exception:
+                    pass
+
+  #check if microntroller has any written logs to send back to python 
+        try:
+            if arduino_serial.in_waiting > 0:
+                response = arduino_serial.readline().decode('utf-8', errors='ignore').strip()
+                if "--> RP2040" in response:
+                    print(response) #just show any logs-- just for tests tbh 
+        except Exception:
+            pass
+
+        display_frame = cv2.resize(frame, (FRAME_WIDTH // 2, FRAME_HEIGHT // 2))
+        
+        cv2.namedWindow("Control Matrix Window", cv2.WINDOW_AUTOSIZE)
+        cv2.imshow("Control Matrix Window", display_frame)
+        cv2.setWindowProperty("Control Matrix Window", cv2.WND_PROP_TOPMOST, 1)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    print("\nShutting Down...")
+
+finally:
+    try:
+        arduino_serial.write(f"{current_tracked_angle},0\n".encode('utf-8'))
+        arduino_serial.close()
+    except Exception:
+        pass
+    cap.release()
+    cv2.destroyAllWindows()
